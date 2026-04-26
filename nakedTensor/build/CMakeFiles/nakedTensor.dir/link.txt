@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -arch arm64 -bundle -Wl,-headerpad_max_install_names -Xlinker -undefined -Xlinker dynamic_lookup -flto -o nakedTensor.cpython-313-darwin.so CMakeFiles/nakedTensor.dir/src/tensor.cpp.o

@@ -1,0 +1,3 @@
+/Users/sartq/Desktop/personalProjects/nakedTensor/build/CMakeFiles/nakedTensor.dir
+/Users/sartq/Desktop/personalProjects/nakedTensor/build/CMakeFiles/edit_cache.dir
+/Users/sartq/Desktop/personalProjects/nakedTensor/build/CMakeFiles/rebuild_cache.dir
