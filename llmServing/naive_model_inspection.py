@@ -11,10 +11,7 @@ def get_device():
         return "mps"
     return "cpu"
 
-def free_gpu(model):
-    if model:
-        del model
-
+def free_gpu():
     device = get_device()
     if device=="cuda":
         torch.cuda.empty_cache()
@@ -250,3 +247,4 @@ if __name__ == "__main__":
     # but if prompt is long then new tokens adds incrementally gradually increasing the time.
     # kv_cache_enabled_inference(model=model, tokenizer=tokenizer, input_prompt=input_prompt, max_new_tokens=500)
     free_gpu(model)
+    del model 
