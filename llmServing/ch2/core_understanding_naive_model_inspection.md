@@ -135,3 +135,47 @@ probs = softmax(logits / temperature)
 495M parameters × 2 bytes (bfloat16) = 990MB ≈ 988MB
 ```
 `numel()` counts scalar values with no concept of bytes per value. `get_model_size` returns parameter **count**, not memory — which is why `calculate_model_memory` exists and multiplies by `bytes_per_param`. If the model were float32: `495M × 4 = ~1.98GB`.
+
+---
+
+## Q13: `probas = torch.softmax(logits, dim=-1)` — what does `dim=-1` mean here?
+
+**Your answer:** Taking into account only the last index.
+
+**Exact answer:** Negative indexing counts from the end — `dim=-1` means the **last dimension**. For logits of shape `(batch_size, vocab_size)`, `dim=-1` refers to `vocab_size`. Softmax normalizes across that dimension, so all 151,936 token scores for a given sequence sum to 1.0 — giving a valid probability distribution over the vocabulary.
+
+`dim=0` would normalize across the batch dimension (comparing different sequences — meaningless).  
+`dim=-1` is preferred over `dim=1` because it works regardless of how many dimensions the tensor has.
+
+---
+
+## Q14: On MPS, KV cache gives ~5-10x speedup over no-KV. On CUDA the gap is even larger. Why?
+
+**Your answer (initial):** CUDA is specially made for fast computation of matrices.
+
+**Follow-up:** That explains why CUDA is faster overall — but not why the *gap between KV and no-KV* is larger on CUDA specifically.
+
+**Guided reasoning:**
+- KV cache eliminates the attention matmul over all past tokens — only the new token's Q is computed, reusing stored K,V
+- Without KV cache, you redo the full attention matmul over the growing sequence every step — O(n²) work
+- With KV cache, the decode step is a tiny matmul (1 token × hidden_size) — too small to saturate any GPU
+
+**Why the gap is larger on CUDA:**
+- CUDA has custom fused kernels (FlashAttention) specifically optimized for the small-matmul decode case — they pipeline memory access and computation to minimize idle GPU time
+- MPS has no such specialized kernels — the 1-token decode step leaves the GPU mostly idle on both paths
+
+```
+No-KV on CUDA      → fast (large matmuls, GPU saturated)
+KV decode on CUDA  → also fast (FlashAttention minimizes idle time)
+
+No-KV on MPS       → slow (large matmuls, MPS less efficient)
+KV decode on MPS   → also slow (small matmuls, no specialized kernels, GPU idle)
+```
+
+The ratio ends up larger on CUDA because KV decode benefits from infrastructure that MPS simply doesn't have.
+
+**Why no fast MPS kernels?**
+- Apple's target use case is graphics and consumer ML training — not high-throughput LLM inference serving
+- FlashAttention and custom CUDA kernels are written by researchers targeting data center GPUs — no equivalent exists for MPS
+- Apple's own answer is **MLX** — a separate framework with Metal kernels optimized for Apple Silicon. For fast LLM inference on Mac, MLX or llama.cpp is the right tool, not PyTorch MPS
+- CUDA has a 15+ year head start (2007) — the entire ML infrastructure stack has been built on top of it over decades
