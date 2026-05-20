@@ -57,6 +57,7 @@ def attention_visualization(model, tokenizer, input_text):
     plt.savefig(f"attention_layer_{layer+1}_head_{head+1}.png")
 
 def simple_inference(model, tokenizer, input_prompt=None, max_new_tokens=100):
+    new_tokens_count = 0
     if input_prompt is None:
         input_prompt = "India is seventh largest country in the world, "
     idx = tokenizer(input_prompt, return_tensors="pt").input_ids.to(model.device)
@@ -86,11 +87,12 @@ def simple_inference(model, tokenizer, input_prompt=None, max_new_tokens=100):
             print(f"time taken for generating a token: {time_cost:.4f} seconds")
         start_time = time.time()
         idx = torch.cat((idx, idx_next), dim=1) # append the new token to the input prompt
+        new_tokens_count += 1
         if idx_next.item()==tokenizer.eos_token_id:
             print("generation completed - eos token came")
             break 
     generated_text = tokenizer.decode(idx[0], skip_special_tokens=True)
-    print(f"total time taken: {time.time()-total_time:.4f} seconds")
+    print(f"total time taken: {time.time()-total_time:.4f} seconds to generate {new_tokens_count} tokens.")
     # both having max new tokens set as 500 ->
     # total time taken: 554.7164 seconds (mps backend)
     # total time taken: 26.6806 seconds (cuda backend)
@@ -105,6 +107,7 @@ def simple_inference(model, tokenizer, input_prompt=None, max_new_tokens=100):
     plt.savefig(f"token_generation_time.png")
 
 def kv_cache_enabled_inference(model, tokenizer, input_prompt=None, max_new_tokens=100):
+    new_tokens_count = 0
     if input_prompt is None:
         input_prompt = "India is seventh largest country in the world, "
     idx = tokenizer(input_prompt, return_tensors="pt").input_ids.to(model.device)
@@ -144,11 +147,12 @@ def kv_cache_enabled_inference(model, tokenizer, input_prompt=None, max_new_toke
             print(f"time taken for generating a token: {time_cost:.4f} seconds")
         start_time = time.time()
         idx = torch.cat((idx, idx_next), dim=1) # append the new token to the input prompt
+        new_tokens_count += 1
         if idx_next.item()==tokenizer.eos_token_id:
             print("generation completed - eos token came")
             break 
     generated_text = tokenizer.decode(idx[0], skip_special_tokens=True)
-    print(f"total time taken: {time.time()-total_time:.4f} seconds")
+    print(f"total time taken: {time.time()-total_time:.4f} seconds to generate {new_tokens_count} tokens.")
     # both having max new tokens set as 500 ->
     # total time taken: 13.8067 seconds - with kv cache (mps backend)
     # total time taken: 2.5959 seconds - with kv cache (cuda backend)
