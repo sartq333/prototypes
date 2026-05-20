@@ -242,9 +242,9 @@ if __name__ == "__main__":
     Today, digital platforms allow billions of people to share messages, media, and experiences in real time. Social media, messaging apps, and video conferencing have broken down geographical barriers and created new ways of building communities. At the same time, these technologies raise important questions about privacy, information overload, and the nature of human interaction.
     Looking ahead, emerging technologies such as virtual reality, brain-computer interfaces, and artificial intelligence promise to once again redefine how we communicate. As we reflect on this history and anticipate the future, one question arises:
     How might the next wave of communication tools shape our relationships, societies, and sense of identity?"""
-    # simple_inference(model=model, tokenizer=tokenizer, input_prompt=input_prompt, max_new_tokens=500)
+    simple_inference(model=model, tokenizer=tokenizer, input_prompt=input_prompt, max_new_tokens=500)
     # interesting observation to note: the time and decoding speed depends on the length of input prompt. if prompt is short then things are consistent.
     # but if prompt is long then new tokens adds incrementally gradually increasing the time.
-    # kv_cache_enabled_inference(model=model, tokenizer=tokenizer, input_prompt=input_prompt, max_new_tokens=500)
-    free_gpu(model)
+    kv_cache_enabled_inference(model=model, tokenizer=tokenizer, input_prompt=input_prompt, max_new_tokens=500)
+    free_gpu()
     del model 
