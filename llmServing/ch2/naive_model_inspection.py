@@ -4,20 +4,19 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import matplotlib.pyplot as plt
 
-def get_device():
-    if torch.cuda.is_available():
-        return "cuda"
-    elif torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+# def get_device():
+#     if torch.cuda.is_available():
+#         return "cuda"
+#     elif torch.backends.mps.is_available():
+#         return "mps"
+#     return "cpu"
 
-def free_gpu():
-    device = get_device()
+def free_gpu(model):
+    device = model.device 
     if device=="cuda":
         torch.cuda.empty_cache()
     elif device=="mps":
         torch.mps.empty_cache()
-
     gc.collect()
 
 def get_model_size(model): 
@@ -250,5 +249,5 @@ if __name__ == "__main__":
     # interesting observation to note: the time and decoding speed depends on the length of input prompt. if prompt is short then things are consistent.
     # but if prompt is long then new tokens adds incrementally gradually increasing the time.
     kv_cache_enabled_inference(model=model, tokenizer=tokenizer, input_prompt=input_prompt, max_new_tokens=500)
-    free_gpu()
+    free_gpu(model=model)
     del model 
