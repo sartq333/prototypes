@@ -26,7 +26,7 @@ class LLMEngine:
                 prompts = []
                 for sequence in active_sequences:
                     prompts.append({"prompt": sequence.prompt, "id": sequence.id})
-                prompts_results = self.model_executor
+                prompts_results = self.model_executor.execute_batch(prompts=prompts)
                 for result in prompts_results:
                     self.workload_manager.update_sequence_output(result["request_id"], result["generated_text"])
                     self.workload_manager.remove_active_sequence(result["request_id"])

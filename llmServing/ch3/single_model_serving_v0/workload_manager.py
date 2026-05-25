@@ -1,5 +1,5 @@
 import uuid 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional
 from queue import Queue
 
 class Sequence:
