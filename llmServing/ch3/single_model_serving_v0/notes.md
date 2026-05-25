@@ -139,6 +139,39 @@ sequenceDiagram
 
 ---
 
+## Threading vs Multiprocessing
+
+These two are used in different places for different reasons.
+
+**Threading** (`threading.Thread` in `LLMEngine`):
+- Multiple threads run inside the **same process**, sharing the same memory.
+- Python's GIL means only one thread runs Python code at a time.
+- Fine for I/O-bound work — waiting, sleeping, blocking on queues.
+- `requests_processing_loop` spends most of its time blocked on `result_queue.get()` or sleeping. Threading is appropriate here, and it gets free access to `WorkloadManager` since they share memory.
+
+**Multiprocessing** (`mp.Process` in `ModelExecutor`):
+- Each process is a separate OS process with its own memory and its own GIL.
+- True parallelism — the GPU runs without interference from the main process.
+- `ModelWorker.run` runs `model.generate` — heavy GPU computation. As a thread, the GIL would block the rest of the program during inference. As a process, it sidesteps the GIL entirely.
+
+### The worker process is permanent
+
+`setup_worker` is called once during `LLMEngine.__init__`. The worker process starts, loads the model into memory (expensive — several seconds), then enters a `while True` loop waiting for batches:
+
+```
+LLMEngine.__init__
+    └── setup_worker()
+            └── mp.Process(target=ModelWorker.run).start()
+                    └── ModelWorker loads model into memory
+                            └── while True: wait → generate → put result → wait → ...
+```
+
+It never exits unless `task_queue.get()` returns `None` (shutdown signal) or the process is killed via `worker_process.terminate()` in `__del__`.
+
+The model is loaded **once** into that process's memory and stays there for the lifetime of the engine. Every batch is handled by the same process, the same loaded model — no reloading between requests.
+
+---
+
 ## Key Design Decisions
 
 **Why a separate process for the worker, not a thread?**
