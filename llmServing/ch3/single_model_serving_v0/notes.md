@@ -172,6 +172,24 @@ The model is loaded **once** into that process's memory and stays there for the 
 
 ---
 
+## Batching Behaviour
+
+**Is there a minimum batch size before sending?**
+
+No. `get_next_batch` sends whatever is available, even if that's just 1 request. `batch_size=4` is a ceiling, not a floor. A batch of 1 is valid.
+
+**What happens if a request arrives while a batch is already being processed?**
+
+It sits in `incoming_queue` and waits. There is no way to interrupt an in-flight batch. When `requests_processing_loop` comes back around after receiving results, `get_next_batch` picks up the waiting request and sends it in the next batch.
+
+This means requests that arrive during inference naturally accumulate — if 3 requests arrive while a batch is processing, they'll all be picked up together as the next batch of 3.
+
+**What this implementation does not have:**
+
+A minimum wait time before sending (called **dynamic batching** or **batch accumulation** in production systems). That pattern would be: "wait up to X milliseconds to collect requests, then send whatever you have." It trades latency for throughput. This implementation has no such timer — it sends immediately whenever the worker is free and requests are waiting.
+
+---
+
 ## Key Design Decisions
 
 **Why a separate process for the worker, not a thread?**
