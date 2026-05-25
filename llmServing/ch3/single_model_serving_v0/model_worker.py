@@ -1,10 +1,13 @@
+"""
+next token generation happens here.
+"""
 import sys
 import logging 
 import torch 
 import multiprocessing as mp 
 from typing import List, Dict, Any, Generator 
-from model_manager import ModelManager 
-from utils import get_device, setup_logging
+from .model_manager import ModelManager 
+from .utils import get_device, setup_logging
 
 logger = setup_logging()
 
@@ -78,7 +81,7 @@ class ModelWorker:
 
             batch = batch_data
 
-            result_queue.put(("complete", worker.generate(batch)))  
+            result_queue.put(worker.generate(batch))
 
 if __name__ == "__main__":
     model_worker = ModelWorker(model_name="HuggingFaceTB/SmolLM2-360M")

@@ -1,3 +1,6 @@
+"""
+model's weight are loaded here.
+"""
 import os
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
