@@ -4,5 +4,6 @@ if __name__ == "__main__":
     engine = LLMEngine()
     results = engine.generate(
         ["What is the capital of France", "Who is Narendra Modi?",
-         "Who are you?", "What is the source of income of huggingface?"]
+         "Who are you?", "What is the source of income of huggingface?",
+         "Do you know about Anthropic?"]
     )
