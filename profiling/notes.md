@@ -140,3 +140,104 @@ what it captured. `wait` exists to let cold-start noise (first CUDA context use,
 cudnn/cutlass algorithm selection, page faults) settle before profiling even
 attaches; `warmup` exists to let the profiler's own instrumentation overhead
 settle before its data is trusted.
+
+## Not every trace gap is your code's fault: CUPTI "Activity Buffer Request"
+
+From the [HF PyTorch profiler blog post](https://huggingface.co/blog/torch-profiler),
+Figures 8-11: the CPU and GPU lanes in a trace can show an offset (their example:
+~2.5ms) between "CPU submitted the kernel" and "GPU shows it executing." The
+instinct is to blame launch overhead or a stalled GPU — but that's not what this is.
+
+**What a "buffer request" is:** GPU-side activity recording (kernel start/end
+timestamps, etc.) isn't free — PyTorch's profiler relies on CUPTI, which needs a
+chunk of GPU VRAM ("buffer") to write activity records into as they happen. An
+"Activity Buffer Request" is CUPTI asking to allocate one. It's profiler
+bookkeeping, not part of the actual matmul/add compute.
+
+**Why the initial offset happens:** before any GPU activity can be recorded, the
+first buffer has to be allocated, and that allocation isn't instant. It happens
+right as the first kernels are submitted, so the recording lags the real
+submission — even though the GPU may have already started. Counterintuitively,
+`wait`/`warmup` don't prevent this: they warm up *your* code path, not the
+profiler's own first-buffer-allocation cost, since buffers aren't pre-allocated
+during those phases either.
+
+**Why a gap can appear mid-trace (e.g. between the matmul and add kernel in one
+step):** each buffer has finite capacity. If it fills up mid-step, CUPTI has to
+pause, request a new one, and resume — that pause shows up as a gap between two
+kernels that should otherwise run back-to-back.
+
+**How to tell this apart from a real bug:** run many more active iterations (the
+post used `active=20`) and see if the gap recurs on a predictable, periodic
+pattern (→ likely a real per-step cost in your code) or shows up once/rarely (→
+almost certainly a one-off profiler buffer reallocation, not something wrong with
+your algorithm). In the post's case the gap appeared exactly once across 20
+iterations, confirming it was profiler-internal.
+
+Ties back to the sanity-check list above: a trace can lie to you not just via bugs
+in your code, but via the profiler's own instrumentation overhead. Always ask
+*why* a gap exists — profiler housekeeping and real algorithmic stalls can look
+identical at a glance.
+
+## `aten::mm` has two CUDA calls, `aten::add` has one — but the exact API names can differ
+
+The blog post notes that `aten::mm` triggers two CUDA Runtime calls
+(`cudaOccupancyMaxActiveBlocksPerMultiprocessor` + `cudaLaunchKernel`), while
+`aten::add` only triggers one (`cudaLaunchKernel`). Checked our own
+`64_bf16_cold_eager.json` and found the same *shape* of asymmetry, but different
+specific calls:
+
+```
+aten::mm  (dur=89.92us)
+├── cudaDeviceGetAttribute  (cuda_runtime)
+└── cuLaunchKernel          (cuda_driver)
+
+aten::add (dur=18.28us)
+└── cudaLaunchKernel        (cuda_runtime)
+```
+
+Two calls for `mm`, one for `add` — matches the post. What differs is which API
+fills each slot:
+
+- **Query call** (`cudaOccupancyMaxActiveBlocksPerMultiprocessor` vs
+  `cudaDeviceGetAttribute`): both are the matmul kernel-selection logic
+  (cutlass/cuBLAS) asking the device something before picking a kernel
+  variant/launch config. Which exact call gets used depends on the
+  cutlass/cuBLAS version compiled into that PyTorch build. `add` never needs this
+  step since there's no kernel variant to choose between.
+- **Launch call** (`cudaLaunchKernel` vs `cuLaunchKernel`): same job (launch the
+  kernel), different API layer — Runtime API vs the lower-level Driver API. Some
+  kernel-dispatch paths (e.g. cutlass kernels loaded via a driver-level launcher)
+  go through the driver API directly instead of the runtime wrapper.
+
+Takeaway: the *specific* CUDA API calls you see in a trace can vary with PyTorch
+version, CUDA/cutlass version, and GPU architecture — don't expect to see the
+exact same function names as someone else's trace (including a blog post's). What
+should transfer is the underlying intuition: a kernel that needs to choose among
+implementations/launch configs will show extra CPU-side "query" overhead before
+launch; a simple, fixed-dispatch op like elementwise add won't.
+
+## Does `--compile` actually fuse matmul + add into one GPU kernel?
+
+This happens when `--compile` is used (i.e. `torch.compile(matrix_multiplication)`
+is applied — see `args.compile` in `one.py`), which routes execution through
+Inductor instead of eager mode. The question worth asking of any "fusion" claim:
+did it actually produce a fused CUDA kernel, or just fuse at a higher level?
+
+Inductor takes `torch.add(torch.matmul(x, w), b)` and rewrites it into a single
+`aten::addmm(b, x, w)` call — one dispatcher-level op instead of two
+(`aten::matmul` + `aten::add`). But the actual GPU work underneath is still the
+*same* cuBLAS/cutlass GEMM kernel eager mode already used (e.g.
+`ampere_bf16_s16816gemm_bf16_128x256_...` or the `cutlass::Kernel2<...>` kernels
+we've already seen) — no new fused CUDA kernel was generated. `addmm` already
+existed as a single fused-bias-matmul operator in eager mode too; Inductor is just
+choosing to dispatch to it instead of the separate `matmul` + `add` calls.
+
+Takeaway: "fusion" is not one thing. Here it's fusion *at the dispatcher/graph
+level* (fewer op-dispatch calls, less Python/aten overhead) — not fusion *at the
+kernel level* (a new single kernel doing both matmul and add in one GPU launch,
+which is what horizontal/vertical kernel fusion via Inductor's Triton codegen
+would look like for elementwise-heavy graphs). Don't assume "fused" in a trace
+means "one new kernel" — check the actual kernel name in the CUDA lane to be
+sure, same as the sanity-check habit above of not trusting a summary claim without
+looking at the raw trace.

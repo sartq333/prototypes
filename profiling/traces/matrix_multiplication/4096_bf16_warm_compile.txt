@@ -1,0 +1,21 @@
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                             matmul_add         0.00%       0.000us         0.00%       0.000us       0.000us       8.617ms       100.06%       8.617ms       2.872ms             3  
+                                          ProfilerStep*         0.32%      35.380us         3.27%     366.582us     122.194us       0.000us         0.00%       8.612ms       2.871ms             3  
+                                             matmul_add         0.49%      54.991us         2.96%     331.202us     110.401us       0.000us         0.00%       8.612ms       2.871ms             3  
+                             Torch-Compiled Region: 0/0         0.82%      92.250us         2.32%     260.011us      86.670us       0.000us         0.00%       8.612ms       2.871ms             3  
+## Call CompiledFxGraph fq35m6baegawtxkzlcdoo65xmyvi...         0.35%      38.700us         1.28%     143.440us      47.813us       0.000us         0.00%       8.612ms       2.871ms             3  
+                                            aten::addmm         0.54%      60.290us         0.93%     104.740us      34.913us       8.612ms       100.00%       8.612ms       2.871ms             3  
+void cutlass::Kernel2<cutlass_80_tensorop_bf16_s1681...         0.00%       0.000us         0.00%       0.000us       0.000us       8.258ms        95.90%       8.258ms       2.753ms             3  
+                         Memcpy DtoD (Device -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us     353.430us         4.10%     353.430us     117.810us             3  
+                               TorchDynamo Cache Lookup         0.14%      16.200us         0.14%      16.200us       5.400us       0.000us         0.00%       0.000us       0.000us             3  
+                                      Pregraph bytecode         0.04%       4.760us         0.04%       4.760us       1.587us       0.000us         0.00%       0.000us       0.000us             3  
+                 AOTDispatcher Runtime Wrapper Prologue         0.17%      19.561us         0.17%      19.561us       6.520us       0.000us         0.00%       0.000us       0.000us             3  
+                                          aten::squeeze         0.05%       5.260us         0.06%       6.990us       2.330us       0.000us         0.00%       0.000us       0.000us             3  
+                                       aten::as_strided         0.02%       1.730us         0.02%       1.730us       0.577us       0.000us         0.00%       0.000us       0.000us             3  
+                                        cudaMemcpyAsync         0.23%      25.860us         0.23%      25.860us       8.620us       0.000us         0.00%       0.000us       0.000us             3  
+                                 cudaDeviceGetAttribute         0.01%       0.960us         0.01%       0.960us       0.320us       0.000us         0.00%       0.000us       0.000us             3  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 11.204ms
+Self CUDA time total: 8.612ms
