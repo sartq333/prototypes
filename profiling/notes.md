@@ -99,3 +99,44 @@ trace:
    before/after tensor creation should roughly match `3 * size**2 * dtype.itemsize`
    (x, w, b). If it doesn't scale with `--size`, tensors aren't being created the way
    you think.
+
+## Understanding `schedule(wait, warmup, active, repeat)`
+
+Doubts while reading a blog post on the profiler schedule (`wait=1, warmup=1,
+active=3, repeat=1`), and the resolution:
+
+**Q1: what does `repeat` do? (blog didn't explain it)**
+
+`wait + warmup + active` together form one *cycle*. `repeat` is how many times
+that whole cycle runs before the profiler goes idle. `repeat=1` → the cycle runs
+once (1 wait + 1 warmup + 3 active = 5 steps total), and any `prof.step()` calls
+after that record nothing. `repeat=2` would run the cycle twice back-to-back (10
+steps total), giving two independent active windows in the same trace — useful in
+a real training loop to sample multiple points instead of trusting one window.
+`repeat=0` means repeat indefinitely for the life of the profiler context — the
+usual choice when profiling an actual long training run rather than a short
+benchmark script like this one.
+
+**Q2: our loop calls `step()` 5 times (`for _ in range(5)`) — does that mean the
+function actually runs 5 x 3 = 15 times because of `active=3`?**
+
+No — it's 1:1, not multiplicative. Each loop iteration advances the schedule by
+exactly one step, and `prof.step()` is what moves the phase counter forward:
+
+- iteration 1 → `wait` (function runs, profiler not attached, nothing recorded)
+- iteration 2 → `warmup` (function runs, profiler attached and collecting, but the
+  result is thrown away — this exists to let profiler-side bookkeeping, e.g. CUPTI
+  buffers, warm up so the *first* attached call doesn't pollute the trace)
+- iterations 3, 4, 5 → `active` (function runs, this time recorded into the trace)
+
+Total function calls = 5 (matches `range(5)`), total *recorded* calls = 3. This
+matches what we already saw in our own trace: `matmul_add` had `# of Calls = 3`,
+i.e. exactly `active`.
+
+The misconception to drop: `wait`/`warmup` don't mean "skip running the code" —
+the real computation happens on every single call regardless of phase. What
+differs per phase is only whether the profiler is attached and whether it keeps
+what it captured. `wait` exists to let cold-start noise (first CUDA context use,
+cudnn/cutlass algorithm selection, page faults) settle before profiling even
+attaches; `warmup` exists to let the profiler's own instrumentation overhead
+settle before its data is trusted.

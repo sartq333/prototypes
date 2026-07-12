@@ -1,6 +1,8 @@
-import os 
-import argparse 
+import os
+import argparse
 import torch
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def set_device():
     device = "cpu"
@@ -15,7 +17,7 @@ def parse_arguments():
     p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--warmup", action="store_true")
-    p.add_argument("--trace_dir", default="./traces/matrix_multiplication")
+    p.add_argument("--trace_dir", default=os.path.join(SCRIPT_DIR, "traces/matrix_multiplication"))
     return p.parse_args()
 
 def main():
