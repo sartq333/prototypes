@@ -36,6 +36,13 @@ def main():
     def matrix_multiplication(x, w, b):
         return torch.add(torch.matmul(x, w), b)
 
+    """
+    link: https://docs.pytorch.org/docs/2.13/generated/torch.compile.html
+    import torch
+    print(torch._inductor.list_mode_options())
+    Ouptut: {'default': {}, 'lite': {'fallback_by_default': True, 'selective_decompose': True, 'reorder_for_peak_memory': False, 'reorder_for_compute_comm_overlap': False, 'triton.reorder_for_reducing_graph_partitions': False, 'use_pre_grad_passes': False, 'use_joint_graph_passes': False, 'use_post_grad_passes': False, 'use_dce': False, 'allow_buffer_reuse': False}, 'reduce-overhead': {'triton.cudagraphs': True}, 'max-autotune-no-cudagraphs': {'max_autotune': True, 'coordinate_descent_tuning': True}, 'max-autotune': {'max_autotune': True, 'triton.cudagraphs': True, 'coordinate_descent_tuning': True}}
+    """
+
     if args.compile:
         matrix_multiplication =  torch.compile(matrix_multiplication)
     

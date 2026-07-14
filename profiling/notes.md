@@ -241,3 +241,94 @@ would look like for elementwise-heavy graphs). Don't assume "fused" in a trace
 means "one new kernel" — check the actual kernel name in the CUDA lane to be
 sure, same as the sanity-check habit above of not trusting a summary claim without
 looking at the raw trace.
+
+## `torch.compile(mode="reduce-overhead")`: which mode cuts CPU overhead, and why it's a trade, not a free lunch
+
+The blog leaves "which `torch.compile` mode would cut CPU overhead" as an
+assignment. Checked `torch._inductor.list_mode_options()` — of the modes, only
+`"reduce-overhead"` sets `triton.cudagraphs: True` without also paying for
+`max_autotune`'s expensive kernel search. Reasoning before looking: CUDA graphs
+capture a whole sequence of kernel launches once, then replay them via a single
+`cudaGraphLaunch`, skipping the Python interpreter and the ATen dispatcher
+per-op on every subsequent call. This doesn't change *compute* (same kernels,
+same FLOPs) — it only removes *launch* overhead. So it should help most exactly
+where launch overhead dominates (our overhead-bound 64x64 case) and do nothing
+where it's already negligible (our compute-bound 4096x4096 case).
+
+Ran `--compile` with `mode="reduce-overhead"` hardcoded in `one.py`, warm, at
+both sizes, to check the prediction against real traces:
+
+**Size 64 (warm): confirmed, ~17% faster.**
+
+| | eager | compile (`reduce-overhead`) |
+|---|---|---|
+| Per-step wall time (`ProfilerStep` CPU total avg) | 133.804us | 111.520us |
+| Self CUDA total | 6.911us | 9.537us |
+
+Eager's CPU chain (`aten::matmul` → `aten::mm` → `cuLaunchKernel`, then
+`aten::add` → `cudaLaunchKernel` — two dispatched ops, two launches) collapses
+into `TorchDynamo Cache Lookup` (guard check) → `AOTDispatcher` prologue → one
+`cudaGraphLaunch` replaying everything.
+
+Bonus finding, worth being skeptical of "fusion" claims about (see the addmm
+entry above): checked the *untruncated* GPU kernel names via the raw trace
+JSON, and the matmul kernel is byte-identical between eager and compiled
+(`cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x2_nn_align8`), same
+duration (4.609us vs 4.447us) — but the separate `vectorized_elementwise_kernel`
+that did the `add` in eager is **completely absent** from the compiled trace.
+No kernel anywhere does a standalone add. Best explanation: cutlass GEMM
+templates commonly support an optional bias-add *epilogue* as a runtime
+parameter (not a separate template instantiation), so the same kernel symbol
+can run GEMM-only (eager, `aten::mm`) or GEMM+bias-add (compiled) depending on
+the `Params` passed at launch — genuine kernel-level fusion this time, unlike
+the dispatcher-only `addmm` fusion from the blog's example. Not 100% certain
+without deeper tooling (e.g. Nsight Compute) — flagged as the likely
+explanation, not a confirmed one.
+
+**Size 4096 (warm): not just "no gain" — actively slower.**
+
+| | eager | compile (`reduce-overhead`) |
+|---|---|---|
+| Self CUDA total | 9.057ms | 13.047ms |
+| Self CPU total | 11.025ms | 13.258ms |
+
+Two concrete, distinct causes found in the trace, not just generic "compile
+setup cost":
+
+1. **`# of Calls` for the GEMM kernel: 3 (eager) vs 4 (compile).** Only 3
+   `step()` calls happen during `active`, so where's the 4th real GEMM
+   execution coming from? A CUDA graph *replay* still runs the real kernels on
+   the GPU — it only skips CPU-side dispatch/launch, not compute. Best
+   explanation: graph *capture* itself requires actually executing the kernels
+   once for real, in "stream capture mode." The standalone 3-iteration warmup
+   (run before the profiler even attaches) likely wasn't enough to finish
+   Dynamo tracing + AOTDispatcher + capture, so the capture-execution leaked
+   into the first profiled `active` step: 1 real capture-run + 3 real replays
+   = 4, and the extra ~2.7ms of Self CUDA time (10.940ms − 8.253ms ≈ 2.69ms)
+   is almost exactly one GEMM call's cost. Testable: increase the standalone
+   warmup count and check whether `# of Calls` drops back to 3.
+2. **A new kernel, `memcpy128` (644.042us total), doesn't exist in eager at
+   all.** This is `aten::_foreach_copy_` → `multi_tensor_apply_kernel`, a
+   **device-to-device** (GPU VRAM → GPU VRAM, *not* CPU→GPU — the tensors are
+   already created with `device="cuda"`, never touch host memory) copy of the
+   live input tensors into the CUDA graph's static memory buffer. Graph replay
+   needs its inputs at fixed addresses, and Inductor can't assume the caller
+   passes the same tensor objects every time (even though our script happens
+   to), so it conservatively re-copies inputs into the static pool on *every*
+   call — `# of Calls` for this copy is 3, matching every active step, not a
+   one-time setup cost. At size 64 the analogous kernel (`memcpy32_post`) cost
+   1.6us total, invisible. At 4096 (≈33MB per bf16 tensor) it costs 644us —
+   this copy scales with tensor size the same way the actual matmul does,
+   while the launch overhead it's meant to amortize away is roughly constant
+   regardless of size. So the bigger the tensors, the worse this specific
+   trade gets, on top of the launch-overhead savings having nothing to work
+   with in the first place at this size.
+
+Takeaway: `reduce-overhead`/CUDA graphs isn't free — it swaps *launch*
+overhead (roughly constant per op, independent of tensor size) for a
+*copy-in* overhead (scales with tensor size) plus a one-time capture cost that
+can leak into measurements if warmup is insufficient. It's a genuine win only
+when launch overhead was the actual bottleneck (small, overhead-bound
+workloads) — exactly the same overhead-bound-vs-compute-bound framing from the
+64 vs 4096 matmul comparison earlier in these notes, just now costing you
+extra when applied to the wrong regime instead of merely not helping.
