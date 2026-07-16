@@ -332,3 +332,251 @@ when launch overhead was the actual bottleneck (small, overhead-bound
 workloads) — exactly the same overhead-bound-vs-compute-bound framing from the
 64 vs 4096 matmul comparison earlier in these notes, just now costing you
 extra when applied to the wrong regime instead of merely not helping.
+
+# Part 2: nn.Linear / MLP (`two.py`)
+
+## What is a GEMM "epilogue"?
+
+A cutlass GEMM kernel has two conceptually separate internal phases:
+
+1. **Mainloop** — the actual `A @ B` accumulation: tiles of A and B loaded,
+   multiplied via tensor-core MMA instructions, accumulated in
+   registers/shared memory across the K dimension. The "real" matmul compute.
+2. **Epilogue** — what happens to that accumulated result *before it's
+   written out to HBM*: identity (just store it), bias-add (`addmm`), scale
+   (the classic GEMM `alpha`/`beta` convention: `alpha*(A@B) + beta*C`), an
+   activation function (ReLU, GELU), a dtype cast (accumulate fp32, write
+   bf16), etc.
+
+cutlass templates these as two independently swappable pieces, which is why
+kernel names encode epilogue capability separately from mainloop tile/stage
+sizing (`gemm_relu_bf16_64x64_32x6` — `relu` is the epilogue slot,
+`64x64_32x6` is the mainloop's tile/pipeline-stage config).
+
+**Why fusing the epilogue saves real time:** without it, the accumulated
+result would have to leave the chip — the GEMM kernel writes raw `C = A@B`
+to HBM, a *separate* kernel (bias-add/activation) reads it back from HBM,
+computes, writes the final result back to HBM again. Three HBM round trips
+for work that only strictly needs one. A fused epilogue transforms the
+result while it's still on-chip (registers/shared memory) and writes out
+only once — saving 2 of those 3 HBM transactions, plus an entire second
+kernel launch (the CPU dispatch overhead tracked throughout these notes).
+Same "avoid an extra HBM round trip" logic as flash attention fusing softmax
+into the attention matmul instead of materializing the full attention matrix
+to HBM — different op, identical motivation: on-chip data is nearly free to
+touch, HBM round trips are the expensive resource.
+
+## Terminology check: "overhead-bound" is not "memory-bound"
+
+Easy to conflate, but they're two different axes:
+
+- **Overhead-bound vs. GPU-bound**: does wall-clock time get dominated by
+  *CPU dispatch/launch* before the GPU is even busy, or by the *GPU kernel
+  itself*? This is the axis we've been measuring throughout (64 vs 4096
+  matmul, `reduce-overhead`, etc.).
+- **Memory-bound vs. compute-bound** (the roofline axis): *once a kernel is
+  actually running*, is it bottlenecked by HBM bandwidth or by FLOP
+  throughput?
+
+A kernel can be GPU-bound (dominates the trace) while still being
+memory-bound internally, or overhead-bound overall while whatever GPU work
+does happen is compute-bound. Don't collapse these into one axis.
+
+## `nn.Linear`, small shape (`--batch 1024 --in_dim 32 --out_dim 64`, eager): overhead-bound
+
+`Self CPU time total: 162.611us`, `Self CUDA time total: 4.672us` — CUDA is
+~2.8% of combined self time, same class as the 64x64 matmul case. Dispatch
+chain: `aten::linear` → `aten::t` → `aten::addmm` (not `aten::matmul` +
+separate `aten::add` — see below for why).
+
+### Why `aten::linear` calls `addmm` directly in eager mode (no compiler needed)
+
+Unlike our own `torch.add(torch.matmul(x, w), b)` in `one.py` (which eager
+mode runs as two separate, un-fused ops), `nn.Linear`'s forward is *written*
+to call `torch.addmm(bias, input, weight.t())` directly — a single
+dispatcher call. `addmm` isn't a compiler optimization; it's a thin wrapper
+over the GEMM primitive cuBLAS/cutlass has always supported natively
+(`C = beta*C + alpha*(A@B)`, with `beta=1, C=bias`). Eager mode does zero
+automatic rewriting — it just runs exactly the ops you call, in order. So
+there are two distinct paths to the same fused dispatcher-level outcome:
+
+1. A human (here, the `nn.Linear` author) picks the already-fused primitive
+   when writing library code.
+2. A compiler (`torch.compile`/Inductor, see the addmm entry above) rewrites
+   a naively-expressed two-op graph into that same primitive.
+
+Eager mode alone gives you neither unless you call the fused op yourself.
+
+### The `torch.compile` reflex, and why it does ~nothing here
+
+A common reflex is to reach for `torch.compile` whenever a model feels slow.
+For a single GEMM-with-bias, compile has very little to do. This is not a
+bug — it's just that compile needs *more than one operation* to possibly do
+any fusing. `nn.Linear`'s eager-mode call is already the single fused
+`addmm` dispatcher op (see above); there's no second op left for Inductor to
+spot and merge it with. Compile's value shows up once there's an actual
+*graph* of multiple ops to rewrite (our own two-op `matmul` + `add` in
+`one.py`, or a real multi-layer MLP) — not on an op that was already fused
+by the library author before compile ever gets involved.
+
+### Why `aten::t` / `aten::transpose` / `aten::as_strided` cost real CPU time but exactly 0.000us CUDA
+
+These are three distinct, dispatcher-registered ops, not redundant naming:
+
+- `t()` — 2D-specific convenience (swaps dims 0/1, ≤2D only). This is
+  literally what `nn.Linear`'s source calls (`weight.t()`).
+- `transpose(dim0, dim1)` — the general N-D version. `t()`'s own
+  implementation calls this — hence they nest as parent→child in the trace;
+  it's the real call stack, not duplicated bookkeeping.
+- `as_strided()` — the actual primitive: builds a new view (new
+  sizes/strides/storage_offset) over the *same* storage, zero copy.
+
+All three show nonzero **CPU** time because even a metadata-only view goes
+through the full C++ dispatcher: dispatch-key resolution, shape/stride
+legality checks, computing new stride values, allocating a new (lightweight
+but real) `TensorImpl`. None of that touches the GPU — same category of cost
+as `cuLaunchKernel`/`cudaLaunchKernel` (framework overhead), just for a
+CPU-only op instead of a kernel launch.
+
+They show exactly **0.000us CUDA** — not just small — because the transpose
+is never materialized as a physically-transposed tensor in GPU memory at
+all. Confirmed by checking the exact (untruncated) kernel name for this
+trace:
+
+```
+cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_64x2_tn_align8>
+```
+
+The `_tn_` is a GEMM naming convention: `t` = this operand is read
+*as transposed*, `n` = normal, baked into which kernel variant cutlass
+selects. Compare against `one.py`'s hand-written `torch.matmul(x, w)` (no
+transpose in the math), which picked an `_nn_` kernel — same family, same
+tile size (`32x32_64x2`), differing only in the transpose flag. The
+`as_strided` view (new strides, zero copy) gets passed straight into the
+GEMM's launch parameters, and the `_tn_` kernel reads that operand according
+to those strides as part of its own memory access pattern *during* the
+multiply. No separate transpose kernel is ever launched — the CPU-side
+dispatcher chain *is* the entire cost of the transpose, because a metadata
+rewrite is the entire work involved.
+
+### Kernel names encode capability, not necessarily what ran
+
+Side finding while checking kernel names: the large-shape run
+(`--in_dim 2048 --out_dim 2048`) picked
+`cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8` — "relu"
+in the name despite no activation function anywhere in `two.py`. This is a
+cutlass template-naming quirk: the template class is named for the most
+general epilogue it *supports* (bias-add, optional ReLU, etc.), but which
+epilogue actually executes is a runtime `Params` choice, same principle as
+the `addmm` bias-epilogue fusion discussion above. Don't read a kernel name
+as a literal description of what ran without checking — the name identifies
+capability, not necessarily the specific invocation.
+
+## `nn.Linear`, large shape (`--batch 1024 --in_dim 2048 --out_dim 2048`, eager): GPU-bound
+
+`Self CPU time total: 570.493us`, `Self CUDA time total: 546.083us`. Looks
+close to 50/50 at first glance — it isn't. Breaking down where the 570.493us
+of "CPU self time" actually goes:
+
+```
+aten::linear + aten::addmm + aten::t/transpose/as_strided + launches ≈ 156.401us
+cudaDeviceSynchronize                                                = 414.092us (72.6%)
+```
+
+`cudaDeviceSynchronize` isn't dispatch work — it's the CPU blocked, waiting
+for the GPU to finish (same pattern as the 4096x4096 matmul case). Real
+dispatch overhead is ~156.401us — nearly identical to the small linear case's
+162.611us total. Dispatch cost stayed roughly *constant* across a huge shape
+change; only the GPU kernel scaled, from 4.672us to 546.083us (~117x). So
+this has clearly flipped to GPU-bound, not a close call — the raw self-time
+totals looking similar is misleading unless you break down what's actually
+inside "CPU self time."
+
+Open question worth resolving with the roofline check from the sanity-check
+list earlier in these notes: GPU-bound doesn't automatically mean
+compute-bound in the classical sense (see terminology note above). Still
+need to check achieved FLOPs vs. this GPU's peak bf16 tensor-core throughput
+for this exact shape (1024x2048 @ 2048x2048) to know whether it's actually
+compute-bound or memory-bound internally.
+
+## What are cuBLAS, CUTLASS, and GEMM, exactly?
+
+One operation, two different ways to implement it on NVIDIA GPUs:
+
+- **GEMM (General Matrix Multiply)** — a BLAS Level-3 routine. Not just
+  "matmul" — its actual interface is `C = alpha*(A@B) + beta*C`. This is why
+  `addmm` (bias-add) isn't a special case bolted on afterward — bias-add is
+  just `beta=1, C=bias` in GEMM's *default* signature (see the epilogue
+  section above). Every cutlass kernel name seen in these notes has "gemm"
+  baked in (`s161616gemm_bf16...`, `s16816gemm_relu_bf16...`) because each
+  one *is* a GEMM implementation, just specialized differently. GEMM is the
+  operation, not a library — cuBLAS and CUTLASS are two ways to implement it.
+- **cuBLAS** — NVIDIA's own closed-source, prebuilt implementation of BLAS
+  (including GEMM). Call a function (`cublasGemmEx`, etc.), get a kernel
+  NVIDIA hand-tuned for common shapes/dtypes. A black box you call into, not
+  something you customize or recompile.
+- **CUTLASS (CUDA Templates for Linear Algebra Subroutines)** — NVIDIA's
+  open-source, header-only C++ *template* library for building GEMM (and
+  related) kernels. Composable building blocks (tile iterators, warp-level
+  MMA wrappers, epilogue functors) get instantiated into a specific kernel
+  *at compile time*, specialized to an exact shape/dtype/tile-size/epilogue.
+  Every `cutlass::Kernel2<...>` name seen in these traces is a literal C++
+  template instantiation — the different tile sizes (`32x32_64x2` vs
+  `64x64_32x6`), transpose flags (`_nn_` vs `_tn_`), and epilogue capability
+  (`relu` vs plain) are different compile-time specializations of the same
+  general template, not different libraries.
+
+Real observation from our own traces: every single GEMM kernel pulled out of
+a trace so far has been a `cutlass::Kernel2<...>` instantiation — never a
+`cublasGemmEx`-style symbol. PyTorch's ATen backend is choosing the CUTLASS
+path for these bf16/tensor-core shapes on this hardware/PyTorch version,
+consistent with modern PyTorch increasingly preferring CUTLASS for
+tensor-core workloads (deep per-shape specialization, and `torch.compile`'s
+`max-autotune` needing to *generate and search* kernel variants — not
+possible against a closed prebuilt binary).
+
+## "Writing a kernel": the actual compilation stack, and where assembly really shows up
+
+Easy to assume CUTLASS = "GEMM written at the assembly level" vs. cuBLAS
+being higher-level. That's the wrong axis. The real compilation pipeline for
+*any* CUDA kernel — CUTLASS, cuBLAS, or something hand-written from scratch —
+is:
+
+```
+CUDA C++  →  PTX  →  SASS
+```
+
+- **PTX** (Parallel Thread Execution) — an intermediate, assembly-like
+  instruction set. `nvcc` compiles C++ kernels down to this. Portable across
+  a range of GPU generations within a compute-capability family.
+- **SASS** (Streaming ASSembler) — the actual native machine code for a
+  *specific* GPU architecture. PTX gets further compiled (`ptxas`, or JIT'd
+  by the driver at load time) into this — what actually runs on the silicon.
+
+Both CUTLASS and cuBLAS go through this same pipeline. CUTLASS is
+overwhelmingly C++ (a template header library), not hand-written assembly.
+Neither is "more assembly" than the other in general — the real axis
+separating them is open-source-and-customizable-at-compile-time (CUTLASS)
+vs. closed-source-fixed-prebuilt-binary (cuBLAS), not "high-level vs.
+assembly."
+
+Real nuance, though: for a handful of the most hardware-specific
+instructions — tensor-core matrix-multiply-accumulate (PTX's `mma.sync`) and
+async memory copy (`cp.async`) — there's no clean C++ way to express them, so
+both CUTLASS and cuBLAS drop to literal inline PTX assembly for just those
+operations, wrapped in a thin C++ function. Narrow and surgical, not "the
+kernel is written in assembly" — closer to 99% C++ orchestration with a few
+assembly-level primitives at the bottom where the hardware demands it.
+
+"Writing a kernel" is a broader category than "writing CUTLASS." The plain
+elementwise `add` kernel from Part 1 (`vectorized_elementwise_kernel`) is
+ordinary hand-written CUDA C++ — no CUTLASS templates involved. CUTLASS is
+specifically for templated, tunable, linear-algebra-heavy kernels (GEMM,
+convolution) where a reusable tiling/epilogue system pays off.
+
+Third path worth knowing, relevant to what's coming up (Liger kernels,
+`torch.compile`'s own codegen): **Triton** — a Python-like DSL, not C++,
+with its own compiler that also lowers through PTX → SASS. Inductor
+generates Triton kernels for a lot of fused ops (not CUTLASS C++), and
+hand-tuned kernel libraries increasingly use Triton for the same reason —
+most of the performance, without C++ template metaprogramming.

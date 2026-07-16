@@ -65,8 +65,10 @@ def main():
     print(f"saving traces: {trace_path}")
     prof.export_chrome_trace(trace_path)
 
+    table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=15)
+    print("profiler key averages time: ", table)
     with open(table_path, "w") as f:
-        f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+        f.write(table)
 
 if __name__ == "__main__":
     main()
