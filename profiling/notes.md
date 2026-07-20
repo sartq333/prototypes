@@ -580,3 +580,314 @@ with its own compiler that also lowers through PTX → SASS. Inductor
 generates Triton kernels for a lot of fused ops (not CUTLASS C++), and
 hand-tuned kernel libraries increasingly use Triton for the same reason —
 most of the performance, without C++ template metaprogramming.
+
+# Real model: profiling Qwen 0.5B prefill (`profile_qwen_05.py`)
+
+Plan, before any real numbers exist — filling in results as we run them.
+
+## Setup decision: HF wrapper, not a reimplementation
+
+Use `AutoModelForCausalLM.from_pretrained(...)` directly rather than
+reimplementing the model. HF's implementation is just PyTorch modules
+underneath (`nn.Linear`, attention, RMSNorm) — profiling it gives the real
+dispatch chain of the model people actually deploy, not a possibly-different
+toy version.
+
+Key setup choice: `attn_implementation` — `"eager"` vs `"sdpa"` vs
+`"flash_attention_2"`. This changes what shows up in the trace completely:
+`"eager"` should look like `four.py`'s `NaiveAttention` (separate `matmul` →
+`mul` → `masked_fill_` → `softmax` → `matmul` ops). `"sdpa"` dispatches to
+`torch.nn.functional.scaled_dot_product_attention`, a single fused op that
+can route to a flash-attention-style kernel — the whole QKᵀ→softmax→AV chain
+done on-chip without ever materializing the full attention score matrix to
+HBM. Same "avoid an HBM round trip" epilogue logic as the GEMM bias-add
+fusion, applied across a whole attention block instead of one GEMM. Plan:
+diff `four.py`'s naive-attention trace against Qwen's `"eager"` trace
+(should look similar) and then against `"sdpa"` (should collapse to one op)
+— makes the fusion benefit concrete instead of abstract.
+
+Isolate-vs-full-model order stays the same as established earlier: full
+model first to find which component actually owns the time budget, then
+pull that component out standalone (HF's real shapes) the same way `four.py`
+already isolates attention.
+
+## Pitfall: don't call `model.generate()` to profile prefill, even with `max_new_tokens=1`
+
+First draft of `profile_qwen_05.py`'s `step()` called
+`model.generate(**model_inputs, max_new_tokens=1)`. This is wrong for
+measuring pure prefill, and it's why the trace didn't look like `one.py`'s
+/`two.py`'s /`four.py`'s clean single-call traces (and why
+`cudaDeviceSynchronize` wasn't where expected).
+
+`generate()` is a heavy Python-level orchestration wrapper around the actual
+forward pass — even for a single new token, it validates the generation
+config, initializes a KV cache object, runs the logits-processor pipeline,
+checks stopping criteria, and does the sampling/argmax step. All of that
+happens *inside* the `record_function("prefill_llm")` scope, so "prefill
+time" ends up contaminated with orchestration overhead that has nothing to
+do with the model's actual `aten::` dispatch chain — exactly the kind of
+CPU-side bookkeeping cost this whole project has been about learning to
+separate from real compute, just reintroduced by a different, higher-level
+API this time.
+
+Fix: call the model directly — `model(**model_inputs)` — one plain forward
+pass over the full prompt, nothing else. That's the real, clean prefill.
+Reserve `generate()` for when decode/the orchestration loop itself is
+deliberately the thing being measured.
+
+### Verified: what `generate()` actually adds (A/B trace diff, `--use_generate` flag)
+
+Added a `--use_generate` flag so both paths write to distinguishable,
+non-overwriting trace files (`llm_direct.json` vs `llm_generate_wrong.json`),
+then diffed op/kernel names between the two traces directly. Result: **87
+distinct op/kernel names appear only in the `generate()` trace, none of them
+touching the model's actual compute.** Three real clusters:
+
+1. **A full top-k/top-p sampling pipeline** — corrects the earlier guess of
+   "just an argmax." Qwen's default `generation_config` samples rather than
+   greedily arg-maxing: `aten::topk`, `aten::sort`, `aten::multinomial`,
+   `aten::exponential_`, `aten::aminmax`, `aten::cumsum`, plus a large set of
+   CUB/thrust GPU sort kernels (`DeviceRadixSortHistogramKernel`,
+   `DeviceRadixSortOnesweepKernel`, `bitonicSortKVInPlace`, `gatherTopK`,
+   ...). Sampling requires sorting the *entire vocab logit distribution* on
+   GPU every generated token — dozens of kernels for what greedy decoding
+   would've done in one reduction. Almost certainly the single largest
+   contributor to the extra time/kernel count.
+2. **EOS/stopping-criteria checking** — matches the original prediction:
+   `aten::eq`, `aten::isin`, `aten::any`, `aten::is_nonzero`, `aten::item`,
+   `aten::_local_scalar_dense` (the actual op underneath `.item()`) appear
+   only in `generate()`. Confirmed quantitatively: `cudaMemcpyAsync` goes
+   from 3 calls (direct) to 54 (generate); `cudaStreamSynchronize` from 3 to
+   21. Checking "is this token EOS" needs a real device-to-host sync to get
+   a Python bool — can't be avoided while staying in Python-level control
+   flow.
+3. **Mask/cache bookkeeping** — `masked_fill_`, `scatter`, `full`, `ones`,
+   `sub`/`rsub`/`div`: extending the attention mask and recomputing
+   cache-position state for a next decode step that never actually runs
+   (since `max_new_tokens=1`), but the bookkeeping still executes.
+
+Raw count: `cudaLaunchKernel` goes from 2,985 (direct) to 3,252 (generate),
+consistent in direction/magnitude with the original 3201→3468 observation
+that started this investigation. Minor unrelated curiosity: `aten::alias`
+appears only in the *direct* trace — a small difference in how the two
+paths construct their output view, not worth chasing further.
+
+## Experiment design for prefill
+
+Correction to the initial framing ("find the optimal input size"): prefill
+doesn't have a single optimal prompt length — there's a **plateau bounded by
+two different failure modes**:
+
+- **Too short**: attention/MLP GEMMs per layer are tiny (like the 64x64
+  matmul case). CPU dispatch overhead is roughly *constant* per layer
+  (established earlier: ~156us regardless of matmul size) and gets paid once
+  per transformer layer (~24 layers for a 0.5B model) for very little actual
+  compute. Overhead-bound, at whole-model scale.
+- **Too long**: attention cost scales O(seq_len²) (QKᵀ and softmax·V both
+  grow quadratically) while MLP/projection cost scales O(seq_len) (linear —
+  same weight matrices, more tokens). So attention's *share* of total
+  prefill time isn't fixed — it grows relative to MLP as seq_len increases,
+  dominating past some crossover point. Separately, KV-cache/activation
+  memory grows with seq_len too — a *capacity* concern (fits in VRAM? how
+  much batch size does it leave elsewhere?), a different axis from the
+  bandwidth-based memory-bound-vs-compute-bound roofline distinction from
+  earlier. Don't conflate "memory" in these two senses.
+
+**Plan:**
+
+1. Fixed batch=1, bf16, eval + `no_grad`, one prefill forward pass per
+   prompt length (not iterated like decode — one call over the full
+   `input_ids`), reusing the established `wait`/`warmup`/`active` schedule
+   pattern.
+2. Sweep seq_len exponentially: 16, 64, 256, 1024, 4096, as far as VRAM
+   allows.
+3. Per run, pull: total wall time → tokens/sec = seq_len / wall_time; Self
+   CPU vs Self CUDA split (watch overhead-bound → GPU-bound transition at
+   whole-model scale); CUDA self-time grouped by op category (attention
+   kernels vs linear/MLP kernels) to see the O(seq_len²) vs O(seq_len)
+   crossover in real numbers; `torch.cuda.max_memory_allocated()` vs seq_len.
+
+That sweep is what should empirically locate the plateau's two edges,
+rather than guessing at a single "ideal" size.
+
+### Implementation: attention-vs-MLP split requires structural scoping, not name matching
+
+Realized before writing any sweep code: you cannot separate "attention CUDA
+time" from "MLP CUDA time" by op or kernel name. Checked Qwen2's actual
+module structure —
+
+```
+Qwen2Attention: q_proj, k_proj, v_proj, o_proj   (all nn.Linear)
+Qwen2MLP:       gate_proj, up_proj, down_proj    (all nn.Linear)
+```
+
+Attention owns four `nn.Linear` layers of its own. Those dispatch through
+the identical `aten::linear` → `aten::addmm` → `cutlass::Kernel2<...>` chain
+as MLP's projections — indistinguishable by name. Fix: wrap `self_attn` and
+`mlp` submodule forwards (for every decoder layer) in a named
+`record_function("attn_block")`/`"mlp_block")` region via a forward-patching
+hook (`instrument_attn_and_mlp` in `profile_qwen_05.py`), so the trace
+carries the attribution structurally regardless of what ops run inside.
+
+### Two aggregation bugs caught before trusting any numbers
+
+Both would have produced numbers off by 3-10x if unnoticed — worth recording
+since they'll recur in any future custom trace-aggregation code:
+
+1. **`sum(e.self_device_time_total for e in events)` over-counts massively**
+   because it includes `record_function` marker/container events
+   (`ProfilerStep*`, `attn_block`, `mlp_block`) alongside real leaf ops.
+   `ProfilerStep*` alone showed `self_device_time_total` of 56ms in a run
+   whose real wall time was ~12ms — the marker's "self" time is a profiler
+   bookkeeping artifact, not compute. Fix: filter `not e.is_user_annotation`
+   before summing — this is what the printed "Self CPU/CUDA time total"
+   table lines already do internally, which is why plain table-reading never
+   hit this but hand-rolled aggregation did.
+2. **Every `record_function` scope appears *twice* in `key_averages()`**:
+   once as a `DeviceType.CPU` entry (`device_time_total` = real correlated
+   child-kernel execution time — what you want) and once as a
+   `DeviceType.CUDA` "device timeline span" entry (start-of-first-kernel to
+   end-of-last-kernel, including any GPU idle gaps in between — 7x larger in
+   one measured case, and not actual compute time). Summing both double/
+   over-counts. Fix: filter to `str(e.device_type) == "DeviceType.CPU"`.
+   This is the same duplicate-row phenomenon first seen (and left
+   unexplained) in the very first `one.py` matmul trace at the start of this
+   project — now properly understood.
+
+Caught both by sanity-checking that `self_cpu_ms`/`self_cuda_ms` should be
+the same order of magnitude as independently-measured `wall_ms`, and that
+`attn_cuda_ms + mlp_cuda_ms` should never exceed total `self_cuda_ms` (a
+version of the "does the number make physical sense" sanity check from
+earlier in these notes) — both were violated before the fix, by ~10x and
+~2x respectively.
+
+### Results: the plateau and the crossover, both empirically confirmed
+
+Full sweep (`--seq_lens 16,64,256,1024,4096,8192,16384`, batch=1, bf16,
+`attn_implementation="eager"`, synthetic random token ids so seq_len is
+exact — see below) on the RTX 5060 Ti:
+
+| seq_len | tok/s | self_cpu_ms | self_cuda_ms | attn_cuda_ms | mlp_cuda_ms | peak_mem_mb |
+|---|---|---|---|---|---|---|
+| 16 | 1,367 | 14.0 | 8.9 | 1.39 | 1.83 | 987 |
+| 64 | 4,400 | 14.0 | 9.4 | 1.42 | 2.02 | 1,002 |
+| 256 | 16,682 | 14.8 | 18.2 | 2.76 | 4.02 | 1,060 |
+| 1024 | **18,152 (peak)** | 65.4 | 122.2 | 32.8 | 14.1 | 1,293 |
+| 4096 | 6,646 | 792.0 | 1,470.1 | 582.2 | 63.1 | 3,346 |
+| 8192 | 3,614 | 2,892.6 | 5,643.4 | 2,474.5 | 148.2 | 10,252 |
+| 16384 | OOM | — | — | — | — | — |
+
+- **Plateau located, not guessed**: throughput peaks at seq_len=1024
+  (18,152 tok/s) for this model/hardware, falling off on both sides exactly
+  as predicted — overhead-bound below it, quadratic-attention-bound above.
+- **The O(seq_len²) vs O(seq_len) crossover is visible and matches the
+  exponents closely**: attention overtakes MLP as the dominant cost between
+  seq_len 256 and 1024. Growth rates confirm the predicted scaling almost
+  exactly — attention CUDA time grew ~17.8x from seq_len 1024→4096 (4x
+  seq_len increase; O(seq_len²) predicts 4²=16x) and ~4.25x from 4096→8192
+  (2x seq_len; predicts 2²=4x). MLP grew ~4.46x and ~2.35x over the same
+  intervals — close to the predicted linear 4x/2x.
+- **Overhead-bound → GPU-bound transition confirmed at whole-model scale**:
+  `self_cpu_ms` stays roughly flat (~14ms) from seq_len 16→256 while
+  `self_cuda_ms` grows underneath it; `self_cuda_ms` overtakes `self_cpu_ms`
+  by seq_len 256→1024 — same story as the isolated 64x4096 matmul case,
+  now reproduced inside a real 24-layer model.
+- **Memory capacity wall found**: peak memory jumps ~3x (3.3GB → 10.3GB) for
+  only a 2x seq_len increase (4096→8192) — consistent with eager attention
+  materializing the full O(seq_len²) score matrix — and OOMs at 16384. This
+  is the actual VRAM ceiling for this model, batch=1, eager attention, on
+  this GPU.
+
+Artifacts: `traces/llm/prefill_sweep.csv` (raw data), `prefill_sweep.png`
+(4-panel matplotlib/seaborn plot: throughput, CPU-vs-CUDA split, attn-vs-MLP
+CUDA time on log-log axes, peak memory — all vs seq_len).
+
+### Word count vs. token count
+
+Earlier runs built prompts via `"what is your name? " * N` (phrase
+repetition) — an imprecise proxy for seq_len since tokenizer merging at
+repeat boundaries doesn't scale token count linearly with N. The sweep
+instead constructs `input_ids` directly as synthetic random token ids
+(`torch.randint(0, vocab_size, (1, seq_len))`) with an all-ones attention
+mask — exact seq_len control, no tokenizer ambiguity. Same "only the shape
+matters for compute cost" reasoning `one.py`/`two.py` already used with
+`torch.randn` synthetic tensors — real text content doesn't affect
+GEMM/attention FLOPs, only the shape does, so there's no need to construct
+real language for a pure compute-shape sweep.
+
+## Serving-system context (why prompt length matters beyond one GPU)
+
+Not directly observable from single-GPU local profiling (this is a systems
+layer above one forward pass), but the mechanistic curves above are the
+actual input these systems are built around:
+
+- **Continuous batching**: servers (vLLM, TGI) dynamically add/remove
+  sequences from a running batch every decode step — prefill and decode
+  requests end up interleaved on the same GPU, not run in separate phases.
+- **Chunked prefill**: exists because of the long-prompt problem above — one
+  huge prefill is a big blocking compute burst that would stall other users'
+  decode latency, so it gets split into chunks interleaved with other
+  sequences' decode steps.
+- **Prefix caching**: shared prefixes (e.g. system prompts) get their KV
+  cache computed once and reused — reduces *effective* prefill cost
+  independent of nominal prompt length.
+- **Short prompts**: not a "can't be hosted" problem — it's the
+  overhead-bound waste above, at the batch level: many small requests
+  processed individually waste proportionally more time on fixed per-request
+  overhead unless batched well.
+
+## In-place ops: what they actually save, and what still applies in an eval/no_grad project like this one
+
+**The convention**: any ATen op with a trailing underscore is the in-place
+variant — `add_()`, `mul_()`, `copy_()`, `masked_fill_()` (already used in
+`four.py`'s `NaiveAttention`: `scores.masked_fill_(mask, float("-inf"))`).
+`x.add_(y)` writes the result into `x`'s existing storage; `x = x + y` (or
+`torch.add(x, y)`) allocates a brand new tensor for the result.
+
+**What's actually saved — memory, primarily, not raw compute speed.** The
+underlying kernel does the same arithmetic either way; an in-place add
+doesn't run a "faster add" kernel. What it avoids is the allocation itself:
+no new O(N) buffer, no extra call into the caching allocator, less
+allocator fragmentation from churn over many calls. Any time savings are
+*indirect* — less allocation/deallocation overhead, not less compute. Don't
+expect an in-place rewrite to show up as a faster kernel in a trace; expect
+it to show up as a lower peak memory number (exactly the `peak_mem_mb`
+column the prefill sweep already tracks).
+
+**The usual big caveat — autograd — mostly doesn't apply to this project.**
+In-place ops can break `backward()` if the original (pre-modified) value is
+needed for a gradient computation; PyTorch's autograd engine tracks a
+version counter per tensor and raises at backward time if it detects this.
+But everything in this project runs under `torch.no_grad()`/`model.eval()`
+for pure inference profiling — no gradients are ever computed, so this
+specific restriction isn't a live concern here the way it would be in a
+training script.
+
+**The caveat that *does* still apply, independent of autograd: aliasing via
+views.** This project has spent a lot of time on exactly this mechanism —
+`.t()`/`.transpose()`/slicing/`as_strided` all create a *view* sharing the
+same underlying storage as the original tensor, not a copy (see the
+`aten::t`/`aten::as_strided` zero-CUDA-time entry above). In-place-modifying
+a view also modifies whatever it's a view *of* — if that original tensor is
+still needed elsewhere (e.g. held for a residual connection), an in-place
+op on a view derived from it is a silent correctness bug, not a crash.
+Worth checking whether a tensor is a fresh allocation or a view before
+converting an op to its in-place form.
+
+**For a pre-built model like Qwen, you don't control most op choices
+directly — this is largely what `torch.compile`/Inductor already
+automates.** HF's modeling code chooses `add`/`mul`/`matmul` etc. as library
+code; rewriting it by hand to use in-place variants is invasive and fragile
+across `transformers` versions. But Inductor's own scheduling passes
+already do exactly this kind of buffer-reuse/memory-planning work as part
+of graph compilation — recall the `"lite"` compile mode's config
+(`torch._inductor.list_mode_options()`, logged earlier) explicitly sets
+`allow_buffer_reuse: False` to *disable* this pass for faster compilation,
+which implies it's *on* by default in normal compile modes and is
+Inductor's automatic version of "make ops in-place/reuse buffers where
+safe." Practical path: rather than manually rewriting ops, compare
+`peak_mem_mb` between an eager sweep and a `torch.compile`-wrapped sweep at
+the same seq_len — the delta (if any) is buffer-reuse working for you
+already, no manual rewriting needed. Manual in-place rewriting is really
+only relevant for custom code you write yourself (e.g. a hand-rolled decode
+loop), not for orchestrating calls into an existing library model.

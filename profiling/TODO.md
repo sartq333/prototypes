@@ -23,18 +23,51 @@
 
 ## Decode-phase profiling (not started — everything so far is prefill only)
 
-- [ ] Build a decode-step profiling script: single new-token forward per
-      step, growing KV cache, `q` at seq_len=1 with `k`/`v` at the cached
-      length, no causal mask needed. Reuse the wait/warmup/active pattern
-      sized for decode (see notes.md's "how many tokens" guidance:
-      `wait=2, warmup=3, active=~20`).
+What to actually check here, beyond just "build the script" — decode is a
+different enough regime from prefill that it needs its own checklist, not
+just a smaller version of the prefill one:
+
+- [ ] **Shape setup**: `q` at seq_len=1, `k`/`v` at the full cached length so
+      far (grows by 1 every step). No causal mask needed — a single new
+      token attends to all past positions, there's nothing in the future to
+      mask.
+- [ ] **Schedule sizing**: `wait=2, warmup=3, active=~20` (per notes.md's
+      "how many tokens" guidance) — decode shape drifts every step (cache
+      keeps growing), so "steady state" needs averaging over more steps than
+      prefill's single-shot measurement, and skipping more cold-start steps.
+- [ ] **The core thing to verify**: decode ops are GEMV-shaped, not
+      GEMM-shaped, and therefore memory-bandwidth-bound, not compute-bound.
+      At batch=1, every matmul in the model — attention's cache lookup *and*
+      the MLP/projection layers (`gate_proj`/`up_proj`/`down_proj`,
+      `q/k/v/o_proj`) — degenerates into a matrix-*vector* product (1 row ×
+      weight matrix), not a matrix-matrix product. A GEMV reads the entire
+      weight matrix from HBM for a tiny amount of compute per byte read —
+      classic low-arithmetic-intensity, bandwidth-bound territory. This is
+      the mechanistic reason decode is expensive per-token relative to its
+      FLOP count, and it's a genuinely different roofline regime than
+      prefill's compute-bound GEMMs. Check: measure achieved HBM bandwidth
+      (bytes moved / time) during a decode step and compare against the RTX
+      5060 Ti's peak memory bandwidth spec — this is the memory-axis
+      counterpart to the FLOPs-based roofline check already planned for
+      prefill above.
+- [ ] **Why batching exists, verified empirically**: batching multiple
+      concurrent sequences' single-token decode steps together turns those
+      GEMV ops back into real GEMMs (batch dimension = number of concurrent
+      sequences), amortizing the HBM weight-read cost across many sequences'
+      worth of compute instead of paying it per sequence. This is the
+      mechanistic reason continuous batching (already covered in notes.md's
+      serving-system section) exists at all. Verify by comparing decode
+      throughput (tokens/sec, summed across sequences) at batch=1 vs. a
+      swept batch size — expect a much better FLOPs-to-bandwidth trade as
+      batch grows, unlike prefill's seq_len sweep which was bandwidth-cheap
+      and compute-hungry in the opposite direction.
 - [ ] Apply `torch.compile(mode="reduce-overhead")` to real Qwen decode
-      steps. Decode is the overhead-bound regime (small batch-of-1-token
-      matmuls) — exactly where CUDA graphs should help most, per the
-      `one.py` matmul investigation. Remember the static-shape requirement:
-      a growing KV cache breaks CUDA graph capture, so this needs
-      bucketing/padding to fixed shapes first (see notes.md's KV-cache
-      gotcha).
+      steps. Decode is the overhead-bound *launch* regime (small
+      batch-of-1-token matmuls, lots of them, once per layer) — exactly
+      where CUDA graphs should help most, per the `one.py` matmul
+      investigation. Remember the static-shape requirement: a growing KV
+      cache breaks CUDA graph capture, so this needs bucketing/padding to
+      fixed shapes first (see notes.md's KV-cache gotcha).
 
 ## torch.compile modes not yet tested empirically
 
