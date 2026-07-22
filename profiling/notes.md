@@ -891,3 +891,82 @@ the same seq_len — the delta (if any) is buffer-reuse working for you
 already, no manual rewriting needed. Manual in-place rewriting is really
 only relevant for custom code you write yourself (e.g. a hand-rolled decode
 loop), not for orchestrating calls into an existing library model.
+
+## What is WMMA? (resolves the `wmma_tensorop` vs `tensorop` open question)
+
+**WMMA = Warp Matrix Multiply-Accumulate.** It's how you get a GPU's
+dedicated **Tensor Cores** — specialized hardware for small matrix
+multiplies, physically separate from the regular CUDA cores that do
+ordinary scalar math — to actually do work.
+
+- **Warp**: 32 CUDA threads execute in lockstep as a group (a warp). WMMA
+  isn't per-thread — all 32 threads cooperate, each holding a fragment of
+  the input matrices in its own registers, together feeding one Tensor Core
+  operation.
+- **Multiply-Accumulate**: computes `A@B + C`, not just `A@B` — exactly the
+  mechanism a GEMM kernel's mainloop uses to build up a full matmul: load a
+  tile of A, a tile of B, multiply-accumulate into the same output
+  registers, slide to the next K-tile, accumulate again, repeat. WMMA is the
+  literal hardware instruction doing that one accumulation step, tile by
+  tile — ties directly to the mainloop/epilogue split in the GEMM epilogue
+  entry above, and it's one of the narrow places where even CUTLASS drops
+  to literal inline PTX assembly (no clean C++ way to issue a Tensor Core
+  instruction) — see the "writing a kernel" compilation-stack entry above.
+
+**Resolves the open question from the very first matmul investigation**
+(why cutlass picked `cutlass_80_wmma_tensorop_bf16_..._32x32_64x2_nn_align8`
+for the small 64x64 case but `cutlass_80_tensorop_bf16_..._64x64_32x6_tn_...`
+for the large 4096x4096/2048x2048 cases). Confirmed via CUTLASS's own GitHub
+discussion (NVIDIA/cutlass#1446): `WmmaTensorOp` uses the higher-level
+`wmma.mma` PTX instruction — the older, easier, warp-unified API. Plain
+`TensorOp` uses the lower-level `mma.sync` PTX instruction directly — newer,
+finer control, faster. Small/simple tile configs route through the older
+WMMA-based kernel generator; larger, more performance-critical shapes route
+through the newer, faster `mma.sync`-based path. That's exactly the split
+observed across every trace in this project: small shapes → `wmma_tensorop`,
+large shapes → plain `tensorop`.
+
+## tinygrad's equivalent of `cudaLaunchKernel`: HCQ
+
+Every trace in this project shows PyTorch reaching the GPU by calling into
+NVIDIA's own provided software layer — `cudaLaunchKernel` (CUDA Runtime API)
+or `cuLaunchKernel` (CUDA Driver API). Both are APIs NVIDIA wrote; PyTorch
+asks NVIDIA's driver to launch the kernel for you, and every one of those
+calls carries the real, measured, non-zero CPU-side launch overhead this
+whole project has been about.
+
+tinygrad has an additional, more radical option for NVIDIA/AMD specifically:
+**HCQ** (Hardware Command Queue) — talk to the GPU's hardware command queue
+directly, skipping the vendor runtime layer entirely. Confirmed via
+tinygrad's own docs: "In HCQ, all interactions with devices occur in a
+hardware-friendly manner using command queues... commands [are] issued
+directly to devices, bypassing runtime overhead such as HIP or CUDA."
+tinygrad's `NV=1`/`AMD=1` backends are built on this, explicitly framed as
+reducing Python-side/CPU-side launch time, especially for multi-GPU.
+
+Submitting a kernel through HCQ looks like this — and it's plain Python, the
+whole way down, even at this "closest to hardware" layer:
+
+```python
+HWQueue().wait(signal_to_wait, value_to_wait) \
+         .exec(program, args_state, global_dims, local_dims) \
+         .signal(signal_to_fire, value_to_fire) \
+         .submit(your_device)
+```
+
+Same "record now, execute later" laziness as the Tensor API, just one layer
+lower: each chained method (`.wait`/`.exec`/`.signal`) just appends an
+instruction to a buffer `HWQueue` is building internally — nothing runs yet.
+`.wait`/`.signal` are tinygrad's own synchronization primitives, doing the
+same job `cudaStreamSynchronize` does in the standard API, just implemented
+by tinygrad itself instead of borrowed from NVIDIA. The actual
+hardware-touching moment is `.submit()` — Python reaches outside itself via
+a low-level foreign-function call (`ctypes`-style) into the OS's GPU driver
+interface, writes the command buffer into GPU-visible memory, then pokes a
+specific hardware register (a "doorbell") telling the GPU new work is ready.
+
+So even tinygrad's most direct hardware path is Python all the way down to
+one narrow FFI call at the very bottom — not fundamentally different in
+spirit from how PyTorch's Python call eventually bottoms out in a C++
+`cudaLaunchKernel` call, just that tinygrad wrote that bottom layer itself
+instead of using NVIDIA's.

@@ -79,9 +79,17 @@ just a smaller version of the prefill one:
 
 ## Other open threads
 
-- [ ] Why does cutlass pick different kernel variants at different sizes
-      (`wmma_tensorop` vs plain `tensorop`)? Flagged early in notes.md,
-      never resolved.
+- [x] ~~Why does cutlass pick different kernel variants at different sizes
+      (`wmma_tensorop` vs plain `tensorop`)?~~ Resolved: `WmmaTensorOp` uses
+      the higher-level `wmma.mma` PTX instruction (older, easier, warp-level
+      unified API); plain `TensorOp` uses the lower-level `mma.sync` PTX
+      instruction directly (newer, faster, finer control). Small shapes
+      (64x64 matmul, small `nn.Linear`) picked `wmma_tensorop`; large shapes
+      (2048x2048, 4096x4096) picked plain `tensorop` — consistent with
+      CUTLASS routing smaller/simpler tile configs through the older WMMA
+      path and larger, more performance-critical shapes through the newer
+      `mma.sync` path. See notes.md's WMMA entry for the full writeup and
+      source.
 
 ## From the original learning plan (HF blog Part 2)
 
