@@ -220,3 +220,35 @@ if __name__ == "__main__":
     decoded_text = tokenizer.decode(out.squeeze(0).tolist())
     print(out)
     print(f"output text: {decoded_text}")
+
+"""
+import torch
+import torch.nn as nn
+
+context_length = 10 # 256, kept it 10 just for representation purposes
+mask = torch.triu(torch.ones(context_length, context_length), diagonal=1)
+print("mask: ", mask)
+
+num_keys = 4 # total length - including the current one
+num_tokens = 1
+mask_bool_1 = mask.bool()[:num_keys, :num_keys][-num_tokens:]
+mask_bool_2 = mask.bool()[:num_keys, :num_keys]
+print("mask_bool_1: ", mask_bool_1)
+print("mask_bool_2: ", mask_bool_2)
+
+mask:  tensor([[0., 1., 1., 1., 1., 1., 1., 1., 1., 1.],
+        [0., 0., 1., 1., 1., 1., 1., 1., 1., 1.],
+        [0., 0., 0., 1., 1., 1., 1., 1., 1., 1.],
+        [0., 0., 0., 0., 1., 1., 1., 1., 1., 1.],
+        [0., 0., 0., 0., 0., 1., 1., 1., 1., 1.],
+        [0., 0., 0., 0., 0., 0., 1., 1., 1., 1.],
+        [0., 0., 0., 0., 0., 0., 0., 1., 1., 1.],
+        [0., 0., 0., 0., 0., 0., 0., 0., 1., 1.],
+        [0., 0., 0., 0., 0., 0., 0., 0., 0., 1.],
+        [0., 0., 0., 0., 0., 0., 0., 0., 0., 0.]])
+mask_bool_1:  tensor([[False, False, False, False]])
+mask_bool_2:  tensor([[False,  True,  True,  True],
+                      [False, False,  True,  True],
+                      [False, False, False,  True],
+                      [False, False, False, False]])
+"""
