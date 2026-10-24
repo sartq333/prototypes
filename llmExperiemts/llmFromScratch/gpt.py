@@ -1,7 +1,7 @@
 import torch 
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader 
-import tiktoken 
+import tiktoken
 
 class GPTDataset(Dataset):
     def __init__(self, txt, tokenizer, max_length, stride):
@@ -76,15 +76,22 @@ class MultiHeadAttention(nn.Module):
             torch.triu(torch.ones(context_length, context_length), diagonal=1)
         )
 
-    def forward(self, x):
+    def forward(self, x, use_cache=False, cached_kv=None):
         b, num_tokens, d_in = x.shape
 
         keys = self.W_key(x)
         queries = self.W_query(x)
         values = self.W_value(x)
 
-        keys = keys.view(b, num_tokens, self.num_heads, self.head_dim)
-        values = values.view(b, num_tokens, self.num_heads, self.head_dim)
+        if use_cache and cached_kv is not None:
+            keys = torch.cat((cached_kv[0], keys), dim=1)
+            values = torch.cat((cached_kv[1], values), dim=1)
+
+        if use_cache:
+            cached_kv = (keys, values)
+        num_keys = keys.shape[1]
+        keys = keys.view(b, num_keys, self.num_heads, self.head_dim)
+        values = values.view(b, num_keys, self.num_heads, self.head_dim)
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)        
 
         keys = keys.transpose(1, 2)
@@ -92,14 +99,14 @@ class MultiHeadAttention(nn.Module):
         values = values.transpose(1, 2)
 
         attn_scores = queries@keys.transpose(2, 3)
-        mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
+        mask_bool = self.mask.bool()[:num_keys, :num_keys][-num_tokens:]
         attn_scores.masked_fill_(mask_bool, -torch.inf)
         attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
         attn_weights = self.dropout(attn_weights)
         context_vec = (attn_weights@values).transpose(1, 2)
         context_vec = context_vec.contiguous().view(b, num_tokens, self.d_out)
         context_vec = self.out_proj(context_vec)
-        return context_vec
+        return context_vec, cached_kv
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
@@ -117,10 +124,10 @@ class TransformerBlock(nn.Module):
         self.norm2 = LayerNorm(cfg["emb_dim"])
         self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
 
-    def forward(self, x):
+    def forward(self, x, use_cache=False, cached_kv=None):
         shortcut = x 
         x = self.norm1(x)
-        x = self.attention(x)
+        x, cached_kv = self.attention(x, use_cache, cached_kv)
         x = self.drop_shortcut(x)
         x += shortcut
         shortcut = x
@@ -128,7 +135,7 @@ class TransformerBlock(nn.Module):
         x = self.ffn(x)
         x = self.drop_shortcut(x)
         x += shortcut
-        return x
+        return x, cached_kv
 
 class GPTModel(nn.Module):
     def __init__(self, cfg):
@@ -136,28 +143,50 @@ class GPTModel(nn.Module):
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
         self.pos_emb = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
         self.drop_emb = nn.Dropout(cfg["drop_rate"])
-        self.trf_blocks = nn.Sequential(
-            *[TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
+        self.trf_blocks = nn.ModuleList(
+            [TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
         )
         self.final_norm = LayerNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
+        self.cached_kv = None   # one (keys, values) per layer, built on the first use_cache call
 
-    def forward(self, in_idx):
-        batch_size, seq_len = in_idx.shape 
+    def reset_kv_cache(self):
+        self.cached_kv = None
+
+    def forward(self, in_idx, use_cache=False):
+        batch_size, seq_len = in_idx.shape
+
+        # tokens already in the cache = positions the new tokens must continue from
+        past_len = 0
+        if use_cache and self.cached_kv is not None:
+            past_len = self.cached_kv[0][0].shape[1]   # layer 0 keys: (b, tokens_so_far, d_out)
+
+        if use_cache and self.cached_kv is None:
+            self.cached_kv = [None] * len(self.trf_blocks)
+
         tok_embeds = self.tok_emb(in_idx)
-        pos_embeds = self.pos_emb(torch.arange(seq_len, device=in_idx.device))
+        # prefill: seq_len = prompt length, positions 0..seq_len-1
+        # decode:  seq_len = 1, so this is just the single position past_len
+        pos_embeds = self.pos_emb(torch.arange(past_len, past_len + seq_len, device=in_idx.device))
         x = tok_embeds + pos_embeds
         x = self.drop_emb(x)
-        x = self.trf_blocks(x)
+        for i, block in enumerate(self.trf_blocks):
+            x, layer_kv = block(x, use_cache, self.cached_kv[i] if use_cache else None)
+            if use_cache:
+                self.cached_kv[i] = layer_kv
         x = self.final_norm(x)
         logits = self.out_head(x)
-        return logits 
+        return logits
 
-def generate_text_simple(model, idx, max_new_tokens, context_size):
+def generate_text_simple(model, idx, max_new_tokens, context_size, use_cache):
+    model.reset_kv_cache()   # every generation starts with an empty cache
     for _ in range(max_new_tokens):
-        idx_cond = idx[:, -context_size:]
+        if use_cache and model.cached_kv is not None:
+            idx_cond = idx[:, -1:]
+        else:
+            idx_cond = idx[:, -context_size:]
         with torch.no_grad():
-            logits = model(idx_cond)
+            logits = model(idx_cond, use_cache)
         logits = logits[:, -1, :]
         idx_next = torch.argmax(logits, dim=-1, keepdim=True)
         idx = torch.cat((idx, idx_next), dim=1)
@@ -175,16 +204,18 @@ if __name__ == "__main__":
     }
     torch.manual_seed(123)
     model = GPTModel(GPT_CONFIG)
+    model.eval()
     tokenizer = tiktoken.get_encoding("gpt2")
     start_context = "welcome to my world"
     encoded = tokenizer.encode(start_context)
     encoded_tensor = torch.tensor(encoded).unsqueeze(0)
     print(f"Input text: {start_context}")
     out = generate_text_simple(
-        model=model, 
-        idx=encoded_tensor, 
-        max_new_tokens=10, 
-        context_size=GPT_CONFIG["context_length"]
+        model=model,
+        idx=encoded_tensor,
+        max_new_tokens=10,
+        context_size=GPT_CONFIG["context_length"],
+        use_cache=True
     )
     decoded_text = tokenizer.decode(out.squeeze(0).tolist())
     print(out)
